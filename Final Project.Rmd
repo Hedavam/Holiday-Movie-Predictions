@@ -1,0 +1,744 @@
+---
+title: "Holiday Movie Predictions"
+author: "Hedavam Solano"
+institute: 'Middlebury College'
+format:
+  html: 
+    code-overflow: wrap
+    code-fold: true
+    embed-resources: true
+execute: 
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introduction
+
+I'm in the holiday spirit, so I chose a dataset of holiday movies (kind of) for analysis.
+
+Research Questions:
+
+1. Could we group films by title type: movie, video, or TV movie?
+2. Could we group holiday movies by decades?
+3. Could we group films by genres?
+4. Could we predict a holiday movie's IMDB Rating?
+
+I found this dataset on Github after doing some research on Reddit from a project called "Tidy Tuesday" that releases a dataset to the public every week. 
+
+Overview of original data:
+```{r}
+#Load Libraries
+library(tidyverse)
+library(gridExtra)
+library(broom)
+library(kableExtra)
+library(caret)
+library(rpart)
+library(rattle)
+library(quanteda)
+library(tidytext)
+library(dendextend)
+library(catboost)
+```
+
+```{r}
+#Used ChatGPT for this
+
+# Create the table
+movie_table <- data.frame(
+  variable = c("tconst", "title_type", "primary_title", "original_title", "year", "runtime_minutes",
+               "genres", "simple_title", "average_rating", "num_votes", "christmas", "hanukkah",
+               "kwanzaa", "holiday"),
+  class = c("character", "character", "character", "character", "double", "double",
+            "character", "character", "double", "double", "logical", "logical",
+            "logical", "logical"),
+  description = c(
+    "alphanumeric unique identifier of the title",
+    "the type/format of the title (movie, video, or tvMovie)",
+    "the more popular title / the title used by the filmmakers on promotional materials at the point of release",
+    "original title, in the original language",
+    "the release year of a title",
+    "primary runtime of the title, in minutes",
+    "includes up to three genres associated with the title (comma-delimited)",
+    "the title in lowercase, with punctuation removed, for easier filtering and grouping",
+    "weighted average of all the individual user ratings on IMDb",
+    "number of votes the title has received on IMDb (titles with fewer than 10 votes were not included in this dataset)",
+    "whether the title includes 'christmas', 'xmas', 'x mas', etc",
+    "whether the title includes 'hanukkah', 'chanukah', etc",
+    "whether the title includes 'kwanzaa'",
+    "whether the title includes the word 'holiday'"
+  )
+)
+
+# Print the table with kable and kable_styling
+kable(movie_table, col.names = c("Variable", "Class", "Description")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+## Data Pre-processing
+
+Notes:
+
+1. Missing Values: 32 'genres' entries have NA values, 189 'runtime_minutes' entries have NA values. The missing data seems to be MCAR , so we will delete related entries.
+
+2. Outliers: 
+
+  - Number of Votes: The data has a lower bound of 10. But, I figure that number of votes are a way to determine the legitimacy of a movie. The average rating may be unreasonably skewed up or down if there isn't enough people voting on the entries. Will set new lower bound at 500, which will encompass about 40% of the dataset.
+   
+  - Runtime: After addressing Number of Votes, some of the runtimes are really short <= 3 minutes and after finding the entries on IMDB, it seems like these might be an incomplete part of a larger piece, so I will remove them.
+  
+  - Kwanzaa: As a result of the 2 outlier removal operations before, the 2 films that mentioned Kwanzaa in their titles have been removed. 
+```{r}
+#Load in Data
+holiday_movies <- read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-12-12/holiday_movies.csv')
+
+#Select relevant columns
+holiday_movies <- holiday_movies %>%
+  select(tconst, title_type, year, runtime_minutes, genres, simple_title, average_rating, num_votes, christmas, hanukkah, kwanzaa, holiday)
+
+#Rename column
+colnames(holiday_movies)[colnames(holiday_movies) == "tconst"] <- "identifier"
+
+cat("The original dataset has", nrow(holiday_movies), "rows and", ncol(holiday_movies), "columns")
+
+#Missing Values
+#colSums(is.na(holiday_movies))
+
+#This data is seems to be MCAR, so we will delete related entries
+holiday_movies <- na.omit(holiday_movies)
+#colSums(is.na(holiday_movies))
+
+#Outliers
+holiday_movies <- holiday_movies %>%
+  filter(num_votes >= 500) %>%
+  filter(runtime_minutes > 20) %>%
+  select(-kwanzaa)
+
+
+
+cat("The 'clean' dataset has", nrow(holiday_movies), "rows and", ncol(holiday_movies), "columns")
+
+#Overall Pre-processing:
+#feature engineering (adding in length of title as feature b/cuz I think it could be a helpful predictor)
+holiday_movies <- holiday_movies %>%
+  mutate(title_length = sapply(strsplit(simple_title, " "), length))
+
+#Research Question 2 Data Pre-processing
+holiday_movies <- holiday_movies %>%
+  mutate(decade = 10 * (year %/% 10))
+
+#Research Question 3 Data Pre-processing
+holiday_movies_single_genres <- holiday_movies %>%
+  filter(!str_detect(genres, ","))
+```
+
+# Exploratory Analysis
+
+For each Research Question:
+
+- Distribution of the outcome we want to predict to look for class imbalances 
+
+- Relationship with a predictor that I think could have a meaningful impact
+
+## Research Question 1
+```{r}
+#target
+holiday_movies %>%
+  ggplot() +
+  geom_bar(aes(x = title_type)) + 
+  labs(title = "Distribution of Title Types in Holiday Movies",
+       x = "Title Type",
+       y = "Count")
+
+#misc
+holiday_movies %>%
+  ggplot() +
+  geom_boxplot(aes(x = title_type, y = average_rating)) + 
+  labs(title = "Average Rating by Title Types",
+       x = "Title Type",
+       y = "Average Rating") +
+  theme_minimal()
+```
+
+## Research Question 2
+```{r}
+#target
+hist(holiday_movies$decade, main = "Distribution of Entries by Decades", xlab = "Decade")
+
+#misc
+holiday_movies %>%
+  ggplot() +
+  geom_bar(aes(x = decade)) +
+  labs(title = "Number of Movies by Holiday and Decade",
+       x = "Decade",
+       y = "Number of Movies") +
+  facet_wrap(~ case_when(christmas ~ "Christmas", hanukkah ~ "Hanukkah", holiday ~ "Holiday"),
+             scales = "free_y") +
+  theme_minimal()
+```
+
+## Research Question 3
+```{r}
+#target
+summary(factor(holiday_movies_single_genres$genres)) %>%
+  sort(decreasing = TRUE) %>%
+  kbl(caption = "Number of Single Genre Listings for Holiday Movies")
+
+#misc
+holiday_movies_single_genres %>%
+  group_by(genres) %>%
+  summarise(`Average Rating` = mean(average_rating)) %>%
+  arrange(desc(`Average Rating`)) %>%
+  kbl(caption = "Average Rating by Genre")
+```
+
+## Research Question 4
+```{r}
+#target
+hist(holiday_movies$average_rating, main = "Distribution of Average Ratings", xlab = "Average Rating")
+
+#misc
+holiday_movies %>%
+  ggplot() +
+  geom_point(aes(x = num_votes, y = average_rating)) +
+  xlim(500, 10000) +
+  labs(title = "Average Rating vs. Number of Votes",
+       x = "Number of Votes",
+       y = "Average Rating") +
+  theme_minimal()
+
+sub_10000_votes <- sum(holiday_movies$num_votes < 10000)
+
+cat("About", sub_10000_votes, "movies have less than 10000 number of votes.", "\nThe above graph represents about", sub_10000_votes/nrow(holiday_movies) * 100, "% of our data")
+```
+
+# Answering Research Questions
+
+## Research Question 1
+**Could we group holiday movies by decades?**
+
+### K-means Clustering
+```{r,fig.width=10, fig.height=5, out.width='100%'}
+#k-means clustering with numerical data w/out num_votes
+K <- 3
+k_means_hm <- kmeans(scale(holiday_movies %>% dplyr::select(year, average_rating, runtime_minutes, title_length)),
+                       K)
+
+three_clusts_theory <- holiday_movies %>%
+  mutate(cluster = k_means_hm$cluster) %>%
+  ggplot() +
+  geom_point(aes(x = year,
+                 y = runtime_minutes,
+                 color = factor(cluster))) +
+  labs(title = "3-means Clustering: Year vs. Runtime (minutes)",
+       x = "Year",
+       y = "Runtime (minutes)") +
+  theme_minimal()
+
+three_clusts_actual <- holiday_movies %>%
+  ggplot() +
+  geom_point(aes(x = year,
+                 y = runtime_minutes,
+                 color = factor(title_type))) +
+  labs(title = "Year vs. Runtime (minutes), colored by Title Type",
+       x = "Year",
+       y = "Runtime (minutes)") +
+  theme_minimal()
+
+# Set the width for each plot
+widths <- c(0.5, 0.5)  # Adjust these values as needed
+
+grid.arrange(three_clusts_theory, three_clusts_actual, ncol=2, widths = widths)
+```
+
+I thought 3-means clustering would help me conveniently group the entries by title_type (since there's 3: video, tvMovie, movie). Comparing the clusters to the actual values, k-means clustering wasn't able to create well-defined clusters that match up with our data. Nonetheless, our plots of the actual values of 'year' and 'runtime' shows us that the title_type 'video' started showing up in our data around the 2000s and tvMovies in the 60s while 'movies' span all our years. 'Videos' and 'tvMovies' tend to have shorter 'runtimes' on average. 'Movies' have very consistent 'runtimes'
+
+```{r, fig.width=10, fig.height=5, out.width='100%'}
+#K-means clustering w/ number of votes (no matter what i put on other axis, num_votes takes precedence); plot them in a box
+#used chatGPT to help loop for this
+
+K <- 3
+k_means_hm <- kmeans(scale(holiday_movies %>% dplyr::select(year, average_rating, runtime_minutes, title_length, num_votes)),
+                       K)
+
+variables <- c("year", "average_rating", "runtime_minutes", "title_length")
+
+# Create a list to store the ggplot objects
+plot_list <- list()
+
+# Iterate over each variable
+for (variable in variables) {
+  plot <- holiday_movies %>%
+    mutate(cluster = k_means_hm$cluster) %>%
+    ggplot() +
+    geom_point(aes(x = !!sym(variable),
+                   y = num_votes,
+                   color = factor(cluster))) +
+    labs(title = paste("3-means clustering for", variable, "vs. Number of Votes")) + 
+    theme_minimal(base_size = 9)
+    
+
+  # Add the plot to the list
+  plot_list[[variable]] <- plot
+}
+
+grid.arrange(plot_list$year, plot_list$average_rating, plot_list$runtime_minutes, plot_list$title_length, ncol=2)
+
+### Same thing, but with actual
+
+K <- 3
+k_means_hm <- kmeans(scale(holiday_movies %>% dplyr::select(year, average_rating, runtime_minutes, title_length, num_votes)),
+                     K)
+
+variables <- c("year", "average_rating", "runtime_minutes", "title_length")
+
+# Create a list to store the ggplot objects
+plot_list <- list()
+
+# Iterate over each variable
+for (variable in variables) {
+  plot <- holiday_movies %>%
+    mutate(cluster = k_means_hm$cluster) %>%
+    ggplot() +
+    geom_point(aes(x = !!sym(variable),
+                   y = num_votes,
+                   color = factor(holiday_movies$title_type))) +
+    labs(title = paste("3-means clustering for", variable, "vs. Number of Votes")) + 
+    theme_minimal(base_size = 9)
+
+  # Add the plot to the list
+  plot_list[[variable]] <- plot
+}
+
+grid.arrange(plot_list$year, plot_list$average_rating, plot_list$runtime_minutes, plot_list$title_length, ncol=2)
+```
+
+'Movies' have a dominant hold of the upper bound of 'number of votes'.
+
+### LDA vs. K-NN
+```{r, fig.width=10, fig.height=5, out.width='100%'}
+#Only select target/predictors
+holiday_movies_q1 <- holiday_movies %>%
+  select(title_type, year, average_rating, runtime_minutes, title_length, num_votes, genres, christmas, hanukkah, holiday)
+
+#Train/test split
+rows_to_keep <- createDataPartition(holiday_movies_q1$title_type, p = 0.8, list = FALSE)
+
+train <- holiday_movies_q1[rows_to_keep, ]
+test <- holiday_movies_q1[-rows_to_keep, ]
+
+#Baseline model
+cat("The dominant class, tvMovie, represents", sum(holiday_movies_q1$title_type == "tvMovie") / nrow(holiday_movies_q1) * 100, "% of our data. \nThus, we will prioritize Kappa in our modeling as it factors in class imbalance \nand will be a good measure of how much our model is actually learning.")
+
+#Set up 5-fold cross-validation
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           savePredictions="final",
+                           classProbs = TRUE)
+
+### LDA ###
+basiclda <- train(title_type ~ ., 
+                 method = "lda", 
+                 preProcess = c("center","scale"),
+                 trControl = fitControl, 
+                 data = train %>%
+                   select(-c(genres, christmas, hanukkah, holiday)))
+
+#Hold-out Set Results
+cat("Comprehensive Confusion Matrix for LDA:")
+predictions <- predict(basiclda, newdata = test)
+confusionMatrix(factor(predictions), factor(test$title_type))
+
+#Adjusting LDA Threshold to adjust predictions for video category (if hypothetically we prioritized getting these right)
+
+#mean(basiclda$pred[,6])
+
+threshold <- 0.01
+hmovieslda <- train %>%
+  mutate(predYESthreshold = case_when(basiclda$pred[,6] >= threshold ~ "POS",
+                                         TRUE ~ "NEG"))
+
+#CF
+ldaAdjustedCF <- table(pred = as.matrix(hmovieslda$predYESthreshold), actual = train$title_type)
+#ldaAdjustedCF
+
+
+### KNN ###
+basicKnn <- train(title_type ~.,
+                 method = "knn", 
+                 preProcess = c("center","scale"),
+                 trControl = fitControl,
+                 data = train %>%
+                   select(-genres, christmas, hanukkah, holiday))
+
+#Hold-out Set Results
+cat("Comprehensive Confusion Matrix for K-NN:")
+predictions <- predict(basicKnn, newdata = test)
+confusionMatrix(factor(predictions), factor(test$title_type))
+
+# Inverse weighing didn't really improve things
+# tuneGrid <- expand.grid(kmax = 1:10, #k range
+#                         distance = 1:10, #distance range (not quite sure)
+#                         kernel = c("inv")) #weight type
+# 
+# tunedknn <-  train(title_type ~ .,
+#                  method = "kknn",
+#                  data =  holiday_movies_q1 %>%
+#                    select(-genres, christmas, hanukkah, holiday),
+#                  preProcess = c("center","scale"),
+#                  trControl = fitControl,
+#                  tuneGrid = tuneGrid)
+
+
+
+
+### D-Tree (to see if adding categorical variables help the model + pretty visualization) ###
+
+#adjusting complexit parameter
+cp_grid <- data.frame(cp = seq(0.005, .006, .0001))
+
+#Training & Tuning (on whole dataset, to avoid genres not matching when evaluating on hold-out)
+dtree1 <- train(factor(title_type)~., data = holiday_movies_q1, method = 'rpart',
+                 trControl = fitControl,
+                 tuneGrid = cp_grid)
+
+cat("For Decision Tree, Kappa obtained with cross-validation on training data\n with best tune:", max(dtree1$results$Kappa))
+
+#Visualizing Tree (can use this for visualization of feature importance)
+fancyRpartPlot(dtree1$finalModel, sub = NULL)
+```
+
+For this research question our classes are pretty imbalanced as there are plenty of 'tvMovies', very few 'videos', and a decent amount of 'movies' (refer to RQ1 Exploratory Analysis question to see visualization of distribution). For LDA vs. K-NN, we used only numerical features as K-NN and LDA require further pre-processing for categorical features. LDA's accuracy was almost comparable to that of K-NN's but its Kappa was noticeably lower. This might be due to the assumption LDA makes about its predictors following a normal distribution. Moreover, K-NN might be capturing some non-linear patters LDA is not picking up on. This notion is backed by the increase in our Kappa after using a Decision Tree, which surprisingly did not use any of the categorical variables added for its splits. If a specific outcome was favorable, we could shift predictions using thresholds.
+
+From the tree visualization, we can see that some of our observations from K-means clustering are picked up on by the Decision Tree as longer runtimes and more votes tip off the model that it's likely dealing with a 'movie'. Some of the splits concerning 'average_rating' suggest that tvMovies have higher 'average_ratings', which matches what we found above in our exploratory analysis for Research Question 2.
+
+### Appending Document Feature Matrix
+```{r}
+holiday_words <- data.frame(word = c("christmas", "hanukkah", "holiday"))
+years <- data.frame(word = c("2017", "2021")) #years mentioned in title that directly match the year the movie was made in 
+
+#Counts
+title_counts <- holiday_movies %>%
+  unnest_tokens(input = simple_title,
+                output = "word",
+                token = "words") %>%
+  anti_join(stop_words) %>%
+  anti_join(holiday_words) %>%
+  anti_join(years) %>%
+  count(word)
+
+#Top 20 words
+cat("Top 20 Most Used Words in Titles")
+title_counts %>%
+  arrange(-n) %>%
+  head(20) %>%
+  kbl()
+
+holiday_words <- c("christmas", "hanukkah", "holiday", "holidays")
+years <- c("2017", "2021")
+
+#Chat GPT helped me with this
+
+#Tokenize, remove unecessary words, cut DFM for words used 10 or more times
+title_dfm <- holiday_movies %>%
+  corpus(text_field = "simple_title") %>%
+  tokens() %>%
+  dfm() %>%
+  dfm_remove(stopwords("en")) %>%
+  dfm_remove(holiday_words) %>%
+  dfm_remove(years) %>%
+  dfm_trim(min_termfreq = 5) %>%
+  convert(to = "data.frame")
+
+#Combine with data we already have
+hmovies_with_dfm <- cbind(holiday_movies, title_dfm)
+```
+
+### PCA to reduce dimensionality introduced by DFM
+```{r}
+#Only select predictors/target
+pca_data <- hmovies_with_dfm %>%
+  select(-c(identifier, year, simple_title, doc_id))
+
+pca1 <- prcomp(pca_data %>% select(-c(genres, title_type, christmas, hanukkah, holiday)), scale = TRUE)
+
+#Might use for modeling in Q2 and/or Q3
+reduced_data <- data.frame(loading_score = pca1$x[,1]) %>%
+  mutate(genres = pca_data$genres,
+         decade = pca_data$decade)
+```
+
+## Research Question 2
+**Could we group holiday movies by decades?**
+```{r}
+#Only select predictors/target 
+holiday_movies_q2 <- hmovies_with_dfm %>%
+  select(-c(identifier, year, simple_title, doc_id))
+```
+
+### Hierarchical Clustering
+```{r}
+hmoviesq2_subset <- holiday_movies_q2 %>%
+  select(-c(title_type, christmas, hanukkah, holiday, genres)) %>%
+  group_by(decade) %>%
+  summarize(
+    across(
+      .cols = everything(),
+      .fns = ~mean(.x)
+    )
+  )
+
+#Let's scale our variables
+hmoviesq2_scaled <- scale(hmoviesq2_subset %>% dplyr::select(-decade))
+
+#Calculate distance metrics
+hmoviesq2_distances <- dist(hmoviesq2_scaled)
+
+#Now, let's do hierarchical clustering
+hc1 <- hclust(hmoviesq2_distances)
+
+#Make it beautiful
+hc1 %>%
+  as.dendrogram() %>%
+  place_labels(hmoviesq2_subset$decade) %>%
+  set("labels_cex", .7) %>%
+  plot()
+
+```
+
+From our dendrogram, we can see that decades from the 21st century differ from 20th century decades, which might be due to the vast majority of entries in our data belonging to the 2000s, 2010s, or 2020s (about 80%). The 1980s and 1990s also form their own cluster. Unsurprisingly, decades that are near each other (time-wise) tend to form clusters with one another.
+
+### Decision Tree & SVM
+```{r, fig.width=10, fig.height=5, out.width='100%'}
+#column names CAN NOT have spaces or numbers or keywords
+colnames(holiday_movies_q2) <- make.names(colnames(holiday_movies_q2), unique = TRUE)
+
+#Enable if classProbs = TRUE in Train Control !!!
+# holiday_movies_q2 <- holiday_movies_q2 %>% 
+#   mutate(decade = factor(decade, 
+#           labels = make.names(levels(factor(decade)))))
+
+#Train/test split
+rows_to_keep <- createDataPartition(holiday_movies_q2$decade, p = 0.8, list = FALSE)
+
+train <- holiday_movies_q2[rows_to_keep, ]
+test <- holiday_movies_q2[-rows_to_keep, ]
+
+#Baseline model
+cat("Movies made in the 21st century (2000s, 2010s, 2020s) represent", nrow(holiday_movies_q2 %>% filter(decade >=2000)) / nrow(holiday_movies_q2) * 100, "% of our data. \nThus, we will prioritize Kappa in our modeling as it factors in class imbalance \nand will be a good measure of how much our model is actually learning.")
+
+cat("For reference, the dominant class, 2010s, represents", sum(holiday_movies_q2$decade == 2010) / nrow(holiday_movies_q2) * 100, "% of our data.")
+
+### D-Tree ###
+
+#Set-up for Cross-Validation and Hyperparameter Tuning
+tC <- trainControl(method = "cv",
+                   number = 5,
+                   savePredictions = TRUE)
+
+cp_grid <- data.frame(cp = seq(0.005, .006, .0001))
+
+#Training & Tuning
+dtree1 <- train(factor(decade)~., data = holiday_movies_q2, method = 'rpart',
+                 trControl = tC,
+                 tuneGrid = cp_grid) 
+
+#Visualizing Tree (can use this for visualization of feature importance)
+fancyRpartPlot(dtree1$finalModel, sub = NULL)
+
+cat("For Decision Tree, Kappa obtained with cross-validation on training data\n with best tune:", max(dtree1$results$Kappa))
+
+#Hold-out Set Results
+# predictions <- predict(dtree1, newdata = test)
+# cf <- confusionMatrix(factor(predictions), factor(test$decade))
+# cat("Decision Tree yields Kappa of: ", cf$overall[2])
+
+
+#D-Tree w/out DFM
+dtree2 <- train(factor(decade)~., data = holiday_movies_q2[, 1:10], method = 'rpart',
+                 trControl = tC,
+                 tuneGrid = cp_grid) 
+
+cat("For Decision Tree without DFM, Kappa obtained with cross-validation on training data\n with best tune:", max(dtree2$results$Kappa))
+
+#Hold-out Set Results
+# predictions <- predict(dtree2, newdata = test)
+# cf <- confusionMatrix(factor(predictions), factor(test$decade))
+# cat("Decision Tree without DFM yields Kappa of: ", cf$overall[2])
+
+
+### SVM (only on the words to see if they have standalone predictive power) using DFM & PCA ###
+
+words_only <- holiday_movies_q2 %>% select(-c(genres, title_type, christmas, hanukkah, holiday, title_length, average_rating, num_votes, runtime_minutes))
+
+#Using appended DFM
+svm1 <- train(factor(decade) ~., data = words_only, method = 'svmLinear2', scale = FALSE)
+
+cat("For SVM using only DFM, Kappa obtained with cross-validation on training data\n with best tune:", max(svm1$results$Kappa))
+
+#Hold-out Set Results
+# predictions <- predict(svm1, newdata = test)
+# cf <- confusionMatrix(factor(predictions), factor(test$decade))
+# cat("SVM yields Kappa of: ", cf$overall[2])
+
+#Using PCA: faster, but model will still not learn much
+svm2 <- train(factor(decade) ~ loading_score, data = reduced_data %>% select(-genres), method = 'svmLinear2')
+
+cat("For SVM with PCA done on DFM, Kappa obtained with cross-validation on training data\n with best tune:", max(svm2$results$Kappa))
+
+#Hold-out Set Results
+# predictions <- predict(svm1, newdata = test)
+# cf <- confusionMatrix(factor(predictions), factor(test$decade))
+# cat("SVM with PCA also yields Kappa of: ", cf$overall[2])
+```
+We could not use holdout-set predictions because due to the very few samples we have for some decades, they don't show up in both the test and train data. 
+
+For more informative results, we could perhaps model this as a different problem and only predict more common decades (2000s - 2020s). But this somewhat takes away from the spirit of the prediction task as it was to notice changes over longer periods of time, so we will just stick with the model as is and call this a loss.
+
+Our decision tree is able to generate a pretty low Kappa. There aren't defined thresholds as to what makes a good Kappa value, but one as low as 0.2 is virtually suggesting that the model learns very little to nothing. I was honestly shocked by these results. I thought adding in the DFM would help because I thought it would help the model pick up on changing language trends. I was sadly mistaken. To add insult to injury, the Kappa was pretty much the same or negligibly higher for a decision tree trained on the data excluding the DFM. 
+
+For the sake of experiment, I tried an SVM on only the DFM to see if the words in titles alone would have any predictive standalone power. They did not with a negligible resulting Kappa of about 0.006. I also used PCA to reduce the dimensions of our DFM and train an SVM on the words faster (and it did) even though this wouldn't help it make better predictions. In fact, the Kappa edged even closer to 0 with the SVM trained on PCA loading score. 
+
+Our decision tree only used our categorical variables 'genres' and 'title_type' for one split and two splits, respectively. The rest of the splits were made with numerical data.
+
+Note: This write-up is based on cross-validated training scores, which change with each run, but not by much. So, the essence of the interpretation should still be valid. 
+
+## Research Question 3
+**Could we group films by genres?**
+
+### Set-up Consideration
+I couldn't find a good way to set this problem up. Initially, I thought we should use single-listing genres ("Horor" vs. "Drama" vs. "Comedy) that showed up "a lot" as it would make distinctions clearer and substantially lower the outcome classes, but this would leave us with a less than 15% of our data available and less than 125 samples. The alternative would be using multiple-listing genres that show up "a lot" like ("Comedy,Romance" vs. "Drama,Romance" vs. "Comedy,Drama,Romance"), which would give us 8 classes for about 50% of our data. I will stick with my initial idea because I think there will be more stark contrasts between single-listing genres even though the smaller sample size might muddy results.
+
+Approach to this decision can be found in following code snippet:
+```{r}
+#Only select predictors/target (only want genre)
+
+#Single-Listing Genres that appear "often"
+#Will Stick with this
+holiday_movies_q3 <- hmovies_with_dfm %>%
+  select(-c(identifier, decade, simple_title, doc_id)) %>%
+  filter(!str_detect(genres, ",")) %>%
+  group_by(genres) %>%
+  filter(n() > 5) %>%
+  ungroup()
+
+cat("Our resulting classes for this prediction task are:", unique(holiday_movies_q3$genres))
+# length(unique(holiday_movies_q3$genres))
+
+#Multiple-Listing Genres that appear "often"
+holiday_movies_q3_alt <- hmovies_with_dfm %>%
+  select(-c(identifier, decade, simple_title, doc_id)) %>%
+  group_by(genres) %>%
+  filter(n() > 25) %>%
+  ungroup()
+
+# unique(holiday_movies_q3$genres_alt)
+# length(unique(holiday_movies_q3_alt$genres))
+```
+
+### Random Forest
+
+The more the merrier! Not only an applicable saying, but also a 1943 Comedy (shockingly not holiday related).
+```{r}
+#Column names CAN NOT have spaces or numbers or keywords
+colnames(holiday_movies_q3) <- make.names(colnames(holiday_movies_q3), unique = TRUE)
+
+### D-Tree ###
+
+#CV setup
+tC <- trainControl(method = "cv",
+                   number = 5,
+                   savePredictions = TRUE)
+
+#D-Tree hyper param tuning setup
+cp_grid <- data.frame(cp = seq(0.005, .02, .001))
+
+#Training & Tuning
+dtree1 <- train(factor(genres)~., data = holiday_movies_q3, method = 'rpart',
+                trControl = tC,
+                tuneGrid = cp_grid)
+
+cat("For Decision Tree: Kappa obtained with cross-validation on training data\n with best tune:", max(dtree1$results$Kappa))
+
+#Set-up for RF hyperparameter tuning
+tG <- expand.grid(mtry = c(5,10,15,20,25,30,35,40),
+                      splitrule = c("extratrees"),
+                      min.node.size = c(5,8))
+
+#Training & Tuning
+rf1 <- train(factor(genres) ~., data = holiday_movies_q3, method = 'ranger', trControl = tC, tuneGrid = tG, importance = "impurity") 
+
+cat("For Random Forest: Kappa obtained with cross-validation on training data\n with best tune:", max(rf1$results$Kappa))
+```
+
+Our Random Forest consistently outperforms the Decision Tree based on observed cross-validation training Kappa and requires only a few more seconds to train. Due to the small sample size, I think it wouldn't make much sense to do hold-out set predictions and would rather use all the data available for training and hope the cross-validation is robust enough to accurately evaluate our models' performances.
+
+# Research Question 4
+**Could we predict a holiday movie’s IMDB Rating?**
+
+I suppose this would be the hardest one to answer so I'll employ boosting trees, notable for their predictive power.
+
+### Catboost
+```{r}
+#Only select predictors/target (only want genre)
+holiday_movies_q4 <- hmovies_with_dfm %>%
+  select(-c(identifier, simple_title, decade, doc_id))
+
+#Train/test split
+rows_to_keep <- createDataPartition(holiday_movies_q4$average_rating, p = 0.8, list = FALSE)
+
+train <- holiday_movies_q4[rows_to_keep, ]
+test <- holiday_movies_q4[-rows_to_keep, ]
+
+#Baseline Model
+target <- holiday_movies_q4$average_rating
+mean_prediction <- mean(holiday_movies_q4$average_rating)
+
+baseline_mae <- mean(abs(target-mean_prediction))
+
+cat("The baseline MAE (if we just predict the mean of averate_rating) is", baseline_mae)
+
+#Column names CAN NOT have spaces or numbers or keywords
+colnames(holiday_movies_q4) <- make.names(colnames(holiday_movies_q4), unique = TRUE)
+
+#Categorical Variables - train
+train$genres <- factor(train$genres)
+train$title_type <- factor(train$title_type)
+
+#Categorical Variables - test
+test$genres <- factor(test$genres)
+test$title_type <- factor(test$title_type)
+
+#CV setup
+tC <- trainControl(method = "cv",
+                   number = 5,
+                   savePredictions = TRUE)
+
+#Set-up for tuning; did trial/error with ranges, diff values. then just set some in stone to save time
+cattG <- expand.grid(depth = c(6,8),
+                    learning_rate = c(0.03, 0.1, 0.15), #large (maybe more accurate - overftting?)
+                    iterations = 100, #not super useful if you also tune learning rate
+                    l2_leaf_reg = 3, #strength of regularization (controls overfitting)
+                    rsm = 0.95, #amount of variables used at each split 0-1 (%)
+                    border_count = 128) #CPU/GPU usage or smth (128 or 254)
+
+##Tuning & Training
+catboost_model <- train(train %>% select(-c(average_rating)), train$average_rating,
+                method = catboost.caret, 
+                metric = "MAE",
+                verbose = 0,
+                tuneGrid = cattG,
+                trControl = tC)
+
+
+#Hold-out Set results
+
+#CF
+predictions <- predict(catboost_model, newdata = test)
+result_mae <- mean(abs(test$average_rating - predictions))
+
+cat("The resulting MAE after using model predictions on holdout set is", result_mae)
+```
+This predictive task is something I was interested in purely for shock value. I'm interested in almost "nailing" some predictions even if I completely miss on others. So, I would take MAE to be my desired measure of accuracy as it won't penalize large errors like RMSE would. It improved a decent amount! 
