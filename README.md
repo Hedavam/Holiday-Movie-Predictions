@@ -1,5 +1,5 @@
 # Holiday Movie Predictions
-> **Blog can be found in Final-Project.html**
+> **Blog can be found in Final Project.html**
 
 ## Motivation
 I was in a festive mood since it was the Holidays. Plus, who doesn't love Holiday Movies?!
