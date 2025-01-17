@@ -1,7 +1,7 @@
 # Holiday Movie Predictions
 
-# Motivation
-I was in a festive mood since it was the Holidays and I love Holiday Movies (who doesn't?) :)
+## Motivation
+I was in a festive mood since it was the Holidays. Plus, who doesn't love Holiday Movies?!
 
 ## Research Questions:
 1. Could we group films by title type: movie, video, or TV movie?
